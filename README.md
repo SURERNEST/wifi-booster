@@ -1,4 +1,4 @@
-# ⚡ Optimizador de Internet PRO 3.1
+# ⚡ Optimizador de Internet PRO 9.1
 
 **Una aplicación de escritorio moderna para Windows que mejora tu conexión a Internet con inteligencia, modos especiales y un diseño profesional.**
 
