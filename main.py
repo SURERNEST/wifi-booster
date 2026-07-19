@@ -1,6 +1,8 @@
 import os
+import re
 import time
 import threading
+import subprocess
 import speedtest
 import requests
 import customtkinter as ctk
@@ -21,7 +23,8 @@ def cambiar_dns(nombre):
     os.system(f'netsh interface ip set dns name="{ADAPTADOR}" static {dns1}')
     os.system(f'netsh interface ip add dns name="{ADAPTADOR}" {dns2} index=2')
     registrar_log(f"DNS cambiado a {nombre}")
-    messagebox.showinfo("DNS", f"DNS cambiado a {nombre}")
+    messagebox.showinfo("DNS", f"DNS cambiado a {nombre}.\n\nNota: esto acelera la carga de webs, "
+                                f"pero NO reduce el ping dentro de un juego online.")
 
 def limpiar_cache_dns():
     os.system("ipconfig /flushdns")
@@ -42,11 +45,11 @@ def registrar_log(mensaje):
 def estado_red():
     try:
         ip_local = os.popen("ipconfig").read().split("IPv4")[1].split(":")[1].split("\n")[0].strip()
-    except:
+    except Exception:
         ip_local = "No encontrada"
     try:
-        ip_publica = requests.get("https://api.ipify.org").text
-    except:
+        ip_publica = requests.get("https://api.ipify.org", timeout=5).text
+    except Exception:
         ip_publica = "No disponible"
     resumen.set(f"📶 IP Local: {ip_local}\n🌍 IP Pública: {ip_publica}")
     registrar_log("Estado de red consultado")
@@ -56,7 +59,7 @@ def verificar_conexion():
         requests.get("https://www.google.com", timeout=2)
         registrar_log("Conexión verificada: OK")
         messagebox.showinfo("Conexión", "✅ Tienes acceso a Internet.")
-    except:
+    except Exception:
         registrar_log("Conexión verificada: SIN ACCESO")
         messagebox.showwarning("Conexión", "❌ No tienes acceso a Internet.")
 
@@ -82,22 +85,86 @@ def test_velocidad():
 def analizar_y_recomendar(bajada, subida, ping):
     recomendaciones = []
     if bajada < 10:
-        recomendaciones.append("🔁 Velocidad baja. Cambia DNS o usa cable.")
+        recomendaciones.append("🔁 Velocidad de bajada baja. Considera hablar con tu ISP.")
     if subida < 3:
-        recomendaciones.append("📤 Subida limitada. Evita apps como Drive.")
+        recomendaciones.append("📤 Subida limitada. Evita apps como Drive/streaming mientras juegas.")
     if ping > 100:
-        recomendaciones.append("🐢 Ping alto. Cierra apps en 2do plano.")
+        recomendaciones.append("🐢 Ping alto hacia el servidor de test. Revisa apps en 2do plano y usa cable.")
     if not recomendaciones:
         recomendaciones.append("✅ Conexión óptima.")
 
     recos.set("\n".join(recomendaciones))
     registrar_log("Recomendaciones generadas.")
 
+# ============== PING A REGIONES (FORTNITE) ==============
+
+def ping_region(host, etiqueta):
+    """Hace ping por consola a un host y devuelve el promedio en ms."""
+    try:
+        resultado = subprocess.run(
+            ["ping", "-n", "4", host],
+            capture_output=True, text=True, timeout=15
+        )
+        salida = resultado.stdout
+        tiempos = re.findall(r"tiempo[=<]\s*(\d+)\s*ms", salida, re.IGNORECASE)
+        if not tiempos:
+            tiempos = re.findall(r"time[=<]\s*(\d+)\s*ms", salida, re.IGNORECASE)
+        if tiempos:
+            promedio = sum(int(t) for t in tiempos) / len(tiempos)
+            return f"{etiqueta}: {promedio:.0f} ms"
+        return f"{etiqueta}: sin respuesta (host podría bloquear ping)"
+    except Exception as e:
+        return f"{etiqueta}: error ({e})"
+
+def test_regiones_fortnite():
+    status.set("Probando rutas hacia Brasil y NA-East...")
+    servidores = {
+        "🇧🇷 Brasil / São Paulo (región oficial de Fortnite para Sudamérica)": "ec2.sa-east-1.amazonaws.com",
+        "🇺🇸 NA-East / Virginia (alternativa a probar)": "ec2.us-east-1.amazonaws.com",
+    }
+    resultados = [ping_region(host, etiqueta) for etiqueta, host in servidores.items()]
+
+    texto = "\n".join(resultados)
+    texto += "\n\n⚠️ Esto es una referencia aproximada (mide la ruta de red, no el servidor exacto de Epic)."
+    texto += "\n\n👉 El dato real está DENTRO del juego:"
+    texto += "\nConfiguración → Juego → Región de Emparejamiento,"
+    texto += "\ny ahí comparas el ping que Fortnite muestra para Brasil vs NA-East y eliges el más bajo."
+    recos.set(texto)
+    status.set("Test de regiones completado.")
+    registrar_log("Test de regiones Fortnite: " + " | ".join(resultados))
+
+def diagnostico_ruta():
+    """Traceroute hacia São Paulo para ver en qué salto se dispara la latencia."""
+    status.set("Ejecutando traceroute (puede tardar ~30s)...")
+    try:
+        resultado = subprocess.run(
+            ["tracert", "-h", "20", "ec2.sa-east-1.amazonaws.com"],
+            capture_output=True, text=True, timeout=60
+        )
+        salida = resultado.stdout.strip()
+        # Guardamos el traceroute completo en el log porque es largo para mostrar en pantalla
+        registrar_log("Traceroute a Brasil:\n" + salida)
+        lineas = salida.splitlines()
+        resumen_lineas = "\n".join(lineas[-8:]) if len(lineas) > 8 else salida
+        recos.set("🛰️ Últimos saltos del traceroute hacia Brasil:\n\n" + resumen_lineas +
+                   "\n\n(traceroute completo guardado en log_optimizador.txt)")
+        status.set("Traceroute completado.")
+    except Exception as e:
+        status.set("⚠️ Error en traceroute")
+        messagebox.showerror("Error", f"No se pudo ejecutar el traceroute: {e}")
+
 # ============== MODOS ESPECIALES ==============
 
 def modo_juego():
-    recos.set("🎮 MODO JUEGO\n\n- Cierra apps de fondo\n- Usa cable\n- DNS: Cloudflare")
-    cambiar_dns("Cloudflare")
+    recos.set(
+        "🎮 MODO JUEGO — lo que de verdad baja el ping:\n\n"
+        "1) Usa cable de red, no WiFi, si es posible.\n"
+        "2) En Fortnite, prueba manualmente la región Brasil (São Paulo) y NA-East (Virginia),\n"
+        "   y quédate con la que muestre menor ping en el juego.\n"
+        "3) Cierra descargas, streaming o backups en otros dispositivos de la casa.\n"
+        "4) Si el router lo permite, activa QoS y prioriza el dispositivo que juega.\n\n"
+        "El DNS (abajo) NO afecta el ping en partida, solo la carga de páginas web."
+    )
     limpiar_cache_dns()
 
 def modo_ahorro():
@@ -113,7 +180,7 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 app = ctk.CTk()
-app.title("⚙️ OPTIMIZADOR DE INTERNET PRO 3.1")
+app.title("⚙️ OPTIMIZADOR DE INTERNET PRO 3.2 — Edición Fortnite")
 app.state("zoomed")  # Pantalla completa al iniciar
 
 # === Scrollable frame para adaptarse ===
@@ -132,6 +199,13 @@ def boton_responsive(texto, accion):
 boton_responsive("🔍 Test de Velocidad + Recomendación", lambda: hilo(test_velocidad))
 boton_responsive("🌐 Ver Estado de Red", lambda: hilo(estado_red))
 boton_responsive("✅ Verificar Conexión a Internet", lambda: hilo(verificar_conexion))
+
+ctk.CTkLabel(scroll_frame, text="──────────────", font=("Segoe UI", 16)).pack(pady=10)
+
+# Fortnite / regiones
+ctk.CTkLabel(scroll_frame, text="🎯 Herramientas para bajar ping en Fortnite", font=("Segoe UI", 18, "bold")).pack(pady=(5, 10))
+boton_responsive("🎯 Comparar Brasil vs NA-East", lambda: hilo(test_regiones_fortnite))
+boton_responsive("🛰️ Diagnóstico de ruta (traceroute a Brasil)", lambda: hilo(diagnostico_ruta))
 
 ctk.CTkLabel(scroll_frame, text="──────────────", font=("Segoe UI", 16)).pack(pady=10)
 
