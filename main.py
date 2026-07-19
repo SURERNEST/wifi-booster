@@ -1,6 +1,9 @@
 import os
 import re
+import sys
 import time
+import ctypes
+import socket
 import threading
 import subprocess
 import speedtest
@@ -8,6 +11,28 @@ import requests
 import customtkinter as ctk
 from tkinter import messagebox
 from datetime import datetime
+
+# ============== AUTO-ELEVACIÓN A ADMINISTRADOR ==============
+# Los comandos netsh (cambiar DNS, reiniciar el adaptador) requieren
+# permisos de administrador en Windows. Si el programa no se está
+# ejecutando como admin, se vuelve a lanzar a sí mismo pidiendo elevación
+# (aparecerá el cuadro de UAC de Windows) y cierra la instancia sin permisos.
+
+def es_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        return False
+
+def relanzar_como_admin():
+    parametros = " ".join(f'"{arg}"' for arg in sys.argv)
+    ctypes.windll.shell32.ShellExecuteW(
+        None, "runas", sys.executable, parametros, None, 1
+    )
+    sys.exit(0)
+
+if os.name == "nt" and not es_admin():
+    relanzar_como_admin()
 
 ADAPTADOR = "Wi-Fi"
 
@@ -96,33 +121,128 @@ def analizar_y_recomendar(bajada, subida, ping):
     recos.set("\n".join(recomendaciones))
     registrar_log("Recomendaciones generadas.")
 
-# ============== PING A REGIONES (FORTNITE) ==============
+# ============== COMPARACIÓN ANTES / DESPUÉS ==============
+# Guarda una "línea base" (velocidad y ping actuales) y luego, tras aplicar
+# los cambios (DNS, modo juego, etc.), vuelve a medir y calcula el % real
+# de mejora o empeoramiento de cada métrica. Todo con datos reales del
+# speedtest, no valores inventados.
 
-def ping_region(host, etiqueta):
-    """Hace ping por consola a un host y devuelve el promedio en ms."""
+baseline = {"bajada": None, "subida": None, "ping": None, "fecha": None}
+
+def calcular_cambio_pct(antes, despues, menor_es_mejor=False):
+    """Devuelve el % de cambio. Si menor_es_mejor=True (caso del ping),
+    una bajada en el valor se reporta como % positivo (mejora)."""
+    if antes == 0:
+        return 0.0
+    cambio = ((despues - antes) / antes) * 100
+    return -cambio if menor_es_mejor else cambio
+
+def flecha_estado(valor_pct):
+    if valor_pct > 1:
+        return "🟢 mejoró"
+    elif valor_pct < -1:
+        return "🔴 empeoró"
+    return "⚪ sin cambio"
+
+def medir_antes():
+    status.set("Midiendo estado ANTES de optimizar...")
     try:
-        resultado = subprocess.run(
-            ["ping", "-n", "4", host],
-            capture_output=True, text=True, timeout=15
-        )
-        salida = resultado.stdout
-        tiempos = re.findall(r"tiempo[=<]\s*(\d+)\s*ms", salida, re.IGNORECASE)
-        if not tiempos:
-            tiempos = re.findall(r"time[=<]\s*(\d+)\s*ms", salida, re.IGNORECASE)
-        if tiempos:
-            promedio = sum(int(t) for t in tiempos) / len(tiempos)
-            return f"{etiqueta}: {promedio:.0f} ms"
-        return f"{etiqueta}: sin respuesta (host podría bloquear ping)"
+        s = speedtest.Speedtest()
+        s.get_best_server()
+        bajada = s.download() / 1_000_000
+        subida = s.upload() / 1_000_000
+        ping = s.results.ping
+
+        baseline["bajada"] = bajada
+        baseline["subida"] = subida
+        baseline["ping"] = ping
+        baseline["fecha"] = datetime.now()
+
+        texto = f"↓ {bajada:.2f} Mbps  ↑ {subida:.2f} Mbps  🕒 Ping: {ping:.0f} ms"
+        status.set("📍 Línea base guardada: " + texto)
+        recos.set("📍 Estado ANTES guardado.\n\nAhora aplica tus optimizaciones "
+                   "(Modo Juego, cambiar DNS, etc.) y luego presiona "
+                   "'📊 Medir DESPUÉS y comparar'.")
+        registrar_log("Línea base (ANTES) guardada: " + texto)
     except Exception as e:
-        return f"{etiqueta}: error ({e})"
+        status.set("⚠️ Error midiendo estado inicial")
+        messagebox.showerror("Error", f"No se pudo medir: {e}")
+
+def medir_despues_comparar():
+    if baseline["bajada"] is None:
+        messagebox.showwarning(
+            "Falta línea base",
+            "Primero presiona '📍 Medir ANTES de optimizar' antes de comparar."
+        )
+        return
+    status.set("Midiendo estado DESPUÉS de optimizar...")
+    try:
+        s = speedtest.Speedtest()
+        s.get_best_server()
+        bajada = s.download() / 1_000_000
+        subida = s.upload() / 1_000_000
+        ping = s.results.ping
+
+        cambio_bajada = calcular_cambio_pct(baseline["bajada"], bajada)
+        cambio_subida = calcular_cambio_pct(baseline["subida"], subida)
+        cambio_ping = calcular_cambio_pct(baseline["ping"], ping, menor_es_mejor=True)
+
+        texto = "📊 COMPARACIÓN ANTES vs DESPUÉS\n\n"
+        texto += (f"↓ Bajada:  {baseline['bajada']:.2f} → {bajada:.2f} Mbps   "
+                   f"{flecha_estado(cambio_bajada)} ({cambio_bajada:+.1f}%)\n")
+        texto += (f"↑ Subida:  {baseline['subida']:.2f} → {subida:.2f} Mbps   "
+                   f"{flecha_estado(cambio_subida)} ({cambio_subida:+.1f}%)\n")
+        texto += (f"🕒 Ping:    {baseline['ping']:.0f} → {ping:.0f} ms       "
+                   f"{flecha_estado(cambio_ping)} ({cambio_ping:+.1f}%)\n\n")
+
+        mejoras = sum(1 for c in (cambio_bajada, cambio_subida, cambio_ping) if c > 1)
+        if mejoras == 3:
+            texto += "✅ Los 3 indicadores mejoraron."
+        elif mejoras == 0:
+            texto += "⚠️ Ningún indicador mejoró de forma notable. Puede ser variación normal del ISP,\n" \
+                     "o que el cambio aplicado no tenga efecto real (recuerda: el DNS no mueve el ping)."
+        else:
+            texto += f"↔️ {mejoras} de 3 indicadores mejoraron."
+
+        recos.set(texto)
+        status.set("Comparación completa.")
+        registrar_log(
+            f"Comparación ANTES/DESPUÉS -> bajada {cambio_bajada:+.1f}%, "
+            f"subida {cambio_subida:+.1f}%, ping {cambio_ping:+.1f}%"
+        )
+    except Exception as e:
+        status.set("⚠️ Error en test DESPUÉS")
+        messagebox.showerror("Error", f"No se pudo ejecutar el test: {e}")
+
+# ============== LATENCIA A REGIONES (FORTNITE) ==============
+# Nota: usamos conexión TCP (no ping ICMP) porque muchos endpoints de nube
+# (incluidos los de AWS) bloquean el ping por seguridad, pero sí responden
+# a una conexión TCP normal (puerto 443). Esto da timeouts falsos con ping
+# aunque el programa se ejecute como administrador; el problema no es de
+# permisos, es que el host no contesta a ICMP.
+
+def medir_latencia_tcp(host, etiqueta, puerto=443, intentos=4, timeout=3):
+    tiempos = []
+    for _ in range(intentos):
+        try:
+            inicio = time.perf_counter()
+            with socket.create_connection((host, puerto), timeout=timeout):
+                pass
+            tiempos.append((time.perf_counter() - inicio) * 1000)
+        except Exception:
+            pass
+    if tiempos:
+        promedio = sum(tiempos) / len(tiempos)
+        return f"{etiqueta}: {promedio:.0f} ms"
+    return f"{etiqueta}: sin respuesta"
 
 def test_regiones_fortnite():
     status.set("Probando rutas hacia Brasil y NA-East...")
     servidores = {
-        "🇧🇷 Brasil / São Paulo (región oficial de Fortnite para Sudamérica)": "ec2.sa-east-1.amazonaws.com",
-        "🇺🇸 NA-East / Virginia (alternativa a probar)": "ec2.us-east-1.amazonaws.com",
+        "🇧🇷 Brasil / São Paulo (región oficial de Fortnite para Sudamérica)": "s3.sa-east-1.amazonaws.com",
+        "🇺🇸 NA-East / Virginia (alternativa a probar)": "s3.us-east-1.amazonaws.com",
     }
-    resultados = [ping_region(host, etiqueta) for etiqueta, host in servidores.items()]
+    resultados = [medir_latencia_tcp(host, etiqueta) for etiqueta, host in servidores.items()]
 
     texto = "\n".join(resultados)
     texto += "\n\n⚠️ Esto es una referencia aproximada (mide la ruta de red, no el servidor exacto de Epic)."
@@ -199,6 +319,13 @@ def boton_responsive(texto, accion):
 boton_responsive("🔍 Test de Velocidad + Recomendación", lambda: hilo(test_velocidad))
 boton_responsive("🌐 Ver Estado de Red", lambda: hilo(estado_red))
 boton_responsive("✅ Verificar Conexión a Internet", lambda: hilo(verificar_conexion))
+
+ctk.CTkLabel(scroll_frame, text="──────────────", font=("Segoe UI", 16)).pack(pady=10)
+
+# Comparación antes/después
+ctk.CTkLabel(scroll_frame, text="📊 Comparar mejora ANTES vs DESPUÉS", font=("Segoe UI", 18, "bold")).pack(pady=(5, 10))
+boton_responsive("📍 1) Medir ANTES de optimizar", lambda: hilo(medir_antes))
+boton_responsive("📊 2) Medir DESPUÉS y comparar (%)", lambda: hilo(medir_despues_comparar))
 
 ctk.CTkLabel(scroll_frame, text="──────────────", font=("Segoe UI", 16)).pack(pady=10)
 
